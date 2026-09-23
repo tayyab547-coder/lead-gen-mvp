@@ -129,8 +129,7 @@ def multi_search(industry: str, location: str, target: int):
     return all_results
 
 # ---------- Ask Groq AI to extract structured info ----------
-PROMPT = """You are a lead data extractor. Your job is to find as many DISTINCT businesses as possible.
-
+PROMPT = """You are a lead data extractor. Return ONLY a JSON object
 From the search results below, extract business leads matching the industry and location.
 
 Industry: {industry}
@@ -188,18 +187,23 @@ def extract_leads(industry, location, results, limit):
         limit=limit,
         results=results_text,
     )
-
-    try:
-        text = call_groq(prompt)
-        text = re.sub(r"^```(json)?", "", text).strip()
-        text = re.sub(r"```$", "", text).strip()
-        data = json.loads(text)
-        if isinstance(data, dict):
-            data = [data]
-        return data
-    except Exception as e:
-        st.warning(f"AI extraction error: {e}")
-        return []
+    def call_groq(prompt: str, json_mode: bool = False):"""Try each Groq model until one works. Optionally force JSON output."""
+    last_error = None
+    for model_name in GROQ_MODELS:
+        try:
+            kwargs = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_error = f"{model_name}: {e}"
+            continue
+    raise RuntimeError(f"All Groq models failed. Last error -> {last_error}")
 
 # ---------- Website enrichment ----------
 def fetch_website_text(url: str, max_chars: int = 3000) -> str:
