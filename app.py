@@ -9,32 +9,21 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from groq import Groq
 
-# Google search library (no API key needed)
 try:
     from googlesearch import search as google_search
     GOOGLE_OK = True
 except ImportError:
     GOOGLE_OK = False
 
-# Fallback search library
 try:
     from ddgs import DDGS
     DDGS_OK = True
 except ImportError:
     DDGS_OK = False
 
-# ---------- Read the key from the .env file ----------
-# Try Streamlit Secrets first (for cloud deployment)
-# Fall back to .env file (for local development)
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except (FileNotFoundError, KeyError):
-    from dotenv import load_dotenv
-    # Try Streamlit Cloud Secrets first, then fall back to local .env
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except (FileNotFoundError, KeyError):
-    from dotenv import load_dotenv
     load_dotenv()
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -42,10 +31,8 @@ if not GROQ_API_KEY:
     st.error("GROQ_API_KEY not found. Check your .env file or Streamlit Secrets.")
     st.stop()
 
-# ---------- Create the Groq client ----------
 client = Groq(api_key=GROQ_API_KEY)
 
-# ---------- Table columns (fields) ----------
 COLUMNS = [
     "Business Name", "Business Category", "Phone Number", "Website",
     "Street Address", "City", "State", "ZIP Code", "Google Maps URL",
@@ -53,52 +40,32 @@ COLUMNS = [
     "LinkedIn", "Source URL",
 ]
 
-# ---------- Current working Groq models (tried in order) ----------
 GROQ_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
+    "qwen/qwen3.6-27b",
 ]
 
-# ---------- SEARCH: Google first, DuckDuckGo fallback ----------
 def google_web_search(query: str, max_results: int = 25):
-    """Scrape Google directly. No API key needed."""
     results = []
     try:
-        for url in google_search(
-            query,
-            num_results=max_results,
-            lang="en",
-            region="us",
-            sleep_interval=2,   # be polite to Google
-            advanced=False,
-        ):
-            results.append({
-                "title": "",
-                "href": url,
-                "body": "",
-            })
+        for url in google_search(query, num_results=max_results, lang="en", region="us", sleep_interval=2, advanced=False):
+            results.append({"title": "", "href": url, "body": ""})
     except Exception as e:
         st.warning(f"Google search error: {e}")
     return results
 
 def ddg_web_search(query: str, max_results: int = 25):
-    """DuckDuckGo fallback search."""
     results = []
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "href": r.get("href", ""),
-                    "body": r.get("body", ""),
-                })
-    except Exception as e:
-        st.warning(f"DuckDuckGo error: {e}")
+                results.append({"title": r.get("title", ""), "href": r.get("href", ""), "body": r.get("body", "")})
+    except Exception:
+        pass
     return results
 
 def web_search(query: str, max_results: int = 25):
-    """Try Google first, fall back to DuckDuckGo."""
     if GOOGLE_OK:
         results = google_web_search(query, max_results)
         if results:
@@ -108,7 +75,6 @@ def web_search(query: str, max_results: int = 25):
     return []
 
 def multi_search(industry: str, location: str, target: int):
-    """Run several query variations and merge unique results."""
     queries = [
         f"{industry} in {location}",
         f"best {industry} {location}",
@@ -125,26 +91,25 @@ def multi_search(industry: str, location: str, target: int):
             if r["href"] and r["href"] not in seen_urls:
                 seen_urls.add(r["href"])
                 all_results.append(r)
-        time.sleep(1)  # small pause between queries
+        time.sleep(1)
     return all_results
 
-# ---------- Ask Groq AI to extract structured info ----------
-PROMPT = """You are a lead data extractor. Return ONLY a JSON object
+PROMPT = """You are a lead data extractor. Return ONLY a JSON object.
+
 From the search results below, extract business leads matching the industry and location.
 
 Industry: {industry}
 Location: {location}
 
-IMPORTANT RULES:
-1. Extract EVERY distinct business you can identify — aim for the maximum count.
-2. Look for business names in titles, URLs, and snippets. A business can be named even if the snippet is short.
-3. Only use information that actually exists in the results. NEVER invent phone numbers, addresses, or emails.
-4. If a field is not found, use an empty string "".
-5. "Source URL" must be the URL where the info was found.
-6. Return a JSON array. No explanation, no markdown, just the array.
-7. Return UP TO {limit} businesses.
+RULES:
+1. Extract EVERY distinct business you can identify.
+2. Only use information that actually exists in the results. NEVER invent data.
+3. If a field is not found, use an empty string "".
+4. "Source URL" must be the URL where the info was found.
+5. Return UP TO {limit} businesses.
 
-For EACH business, use these exact keys:
+Return a JSON object with a single key "leads" whose value is an array of business objects.
+Each business object must have these exact keys:
 "Business Name", "Business Category", "Phone Number", "Website",
 "Street Address", "City", "State", "ZIP Code", "Google Maps URL",
 "Rating", "Review Count", "Email", "Facebook", "Instagram",
@@ -154,40 +119,7 @@ Search results:
 {results}
 """
 
-def call_groq(prompt: str):
-    """Try each Groq model until one works."""
-    last_error = None
-    for model_name in GROQ_MODELS:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            last_error = f"{model_name}: {e}"
-            continue
-    raise RuntimeError(f"All Groq models failed. Last error -> {last_error}")
-
-def extract_leads(industry, location, results, limit):
-    """Call Groq AI to extract leads from search results."""
-    if not results:
-        return []
-
-    trimmed = results[:40]
-    results_text = "\n\n".join(
-        f"Title: {r['title']}\nURL: {r['href']}\nSnippet: {r['body']}"
-        for r in trimmed
-    )
-
-    prompt = PROMPT.format(
-        industry=industry,
-        location=location,
-        limit=limit,
-        results=results_text,
-    )
-    def call_groq(prompt: str, json_mode: bool = False):"""Try each Groq model until one works. Optionally force JSON output."""
+def call_groq(prompt: str, json_mode: bool = False):
     last_error = None
     for model_name in GROQ_MODELS:
         try:
@@ -205,9 +137,34 @@ def extract_leads(industry, location, results, limit):
             continue
     raise RuntimeError(f"All Groq models failed. Last error -> {last_error}")
 
-# ---------- Website enrichment ----------
+def extract_leads(industry, location, results, limit):
+    if not results:
+        return []
+    trimmed = results[:20]
+    results_text = "\n\n".join(
+        f"Title: {r['title']}\nURL: {r['href']}\nSnippet: {r['body']}"
+        for r in trimmed
+    )
+    prompt = PROMPT.format(industry=industry, location=location, limit=limit, results=results_text)
+    for json_mode in (True, False):
+        try:
+            text = call_groq(prompt, json_mode=json_mode)
+            text = re.sub(r"^```(json)?", "", text).strip()
+            text = re.sub(r"```$", "", text).strip()
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                data = parsed.get("leads") or parsed.get("Leads") or []
+            else:
+                data = parsed
+            if data:
+                return data
+        except Exception as e:
+            st.warning(f"Extraction attempt (json_mode={json_mode}) failed: {e}")
+            continue
+    st.error("Could not extract any leads. Try again.")
+    return []
+
 def fetch_website_text(url: str, max_chars: int = 3000) -> str:
-    """Download a webpage and return visible text (trimmed)."""
     if not url or not url.startswith("http"):
         return ""
     try:
@@ -242,18 +199,13 @@ Return ONLY a JSON object (no markdown) with these exact keys:
 """
 
 def enrich_lead(lead: dict) -> dict:
-    """Visit the lead's website and pull extra contact info."""
     website = lead.get("Website", "")
     if not website:
         return lead
     page_text = fetch_website_text(website)
     if not page_text:
         return lead
-    prompt = ENRICH_PROMPT.format(
-        name=lead.get("Business Name", ""),
-        website=website,
-        page_text=page_text,
-    )
+    prompt = ENRICH_PROMPT.format(name=lead.get("Business Name", ""), website=website, page_text=page_text)
     try:
         text = call_groq(prompt)
         text = re.sub(r"^```(json)?", "", text).strip()
@@ -266,7 +218,6 @@ def enrich_lead(lead: dict) -> dict:
         pass
     return lead
 
-# ---------- Clean the data ----------
 def normalize_phone(p):
     if not p:
         return ""
@@ -287,7 +238,6 @@ def clean_df(rows):
     df = df.reset_index(drop=True)
     return df
 
-# ---------- Web interface ----------
 st.set_page_config(page_title="Lead Generation Assistant", layout="wide")
 st.title("Lead Generation Assistant")
 st.caption("MVP — Google search (free scrape), Groq AI extraction, website enrichment.")
