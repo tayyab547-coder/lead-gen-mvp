@@ -1,0 +1,9 @@
+streamlit
+groq
+ddgs
+googlesearch-python
+pandas
+openpyxl
+python-dotenv
+requests
+beautifulsoup4
