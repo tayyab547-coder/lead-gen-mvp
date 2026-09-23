@@ -30,6 +30,11 @@ try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except (FileNotFoundError, KeyError):
     from dotenv import load_dotenv
+    # Try Streamlit Cloud Secrets first, then fall back to local .env
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except (FileNotFoundError, KeyError):
+    from dotenv import load_dotenv
     load_dotenv()
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
