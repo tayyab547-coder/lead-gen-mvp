@@ -1,0 +1,13 @@
+streamlit
+groq
+ddgs
+googlesearch-python
+pandas
+openpyxl
+python-dotenv
+requests
+beautifulsoup4
+gspread
+oauth2client
+reportlab
+lxml

@@ -1,0 +1,10 @@
+venv/
+.env
+__pycache__/
+*.pyc
+history/
+.streamlit/secrets.toml
+.devcontainer/
+*.xlsx
+.vscode/
+.idea/
