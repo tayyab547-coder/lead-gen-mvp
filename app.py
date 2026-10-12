@@ -3,6 +3,8 @@ import re
 import json
 import time
 import uuid
+import base64
+import concurrent.futures
 import requests
 import pandas as pd
 import streamlit as st
@@ -34,90 +36,168 @@ try:
 except ImportError:
     DDGS_OK = False
 
+load_dotenv()
+
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except (FileNotFoundError, KeyError):
-    load_dotenv()
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+try:
+    GCP_JSON_B64 = st.secrets["GCP_JSON_B64"]
+except (FileNotFoundError, KeyError):
+    GCP_JSON_B64 = os.getenv("GCP_JSON_B64", "")
+
 if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY not found. Check your .env file or Streamlit Secrets.")
+    st.error("GROQ_API_KEY not found. Check your .env or Streamlit Secrets.")
     st.stop()
 
 client = Groq(api_key=GROQ_API_KEY)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "LeadGenApp/1.0 (educational)",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# ============================================================
-# SEARCH CACHE + RATE LIMITER
-# ============================================================
 SEARCH_CACHE = {}
 GOOGLE_BLOCKED_UNTIL = 0
 LAST_CALL_TIME = 0
 
-
-def _throttle():
-    global LAST_CALL_TIME
-    elapsed = time.time() - LAST_CALL_TIME
-    if elapsed < 1.5:
-        time.sleep(1.5 - elapsed)
-    LAST_CALL_TIME = time.time()
-
-
-# ============================================================
-# HISTORY
-# ============================================================
 HISTORY_DIR = "history"
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
+COLUMNS = [
+    "Business Name", "Business Category", "Lead Score", "AI Summary",
+    "Phone Number", "Email", "Website",
+    "Street Address", "City", "State", "ZIP Code", "Country",
+    "Google Maps URL", "Rating", "Review Count",
+    "Facebook Page", "Instagram", "LinkedIn Company URL", "YouTube", "Twitter",
+    "Executive Name", "Executive Title", "Executive LinkedIn",
+    "Executive Email", "Email Pattern", "Executive Source",
+    "Source URL",
+    "Audit Score", "Audit Grade", "Issues", "Pitch Angle",
+    "Outreach Status", "Duplicate", "First Seen"
+]
 
-def save_history(industry, location, keywords, df):
-    try:
-        sid = str(uuid.uuid4())[:8]
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        data = {"id": sid, "timestamp": ts, "industry": industry,
-                "location": location, "keywords": keywords,
-                "lead_count": len(df), "leads": df.to_dict(orient="records")}
-        with open(os.path.join(HISTORY_DIR, f"{sid}.json"), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return sid
-    except Exception as e:
-        st.warning(f"Could not save history: {e}")
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+]
+
+EMAIL_TEMPLATES = {
+    "Cold Intro": "Short personalized cold outreach. Under 120 words. Soft CTA for 15-min call.",
+    "Follow-up": "Polite follow-up. Under 100 words.",
+    "LinkedIn Message": "LinkedIn connection under 300 chars.",
+    "Partnership Pitch": "Partnership pitch. Under 150 words.",
+    "Re-engagement": "Re-engage past contact. Under 100 words.",
+}
+
+TONES = ["Professional", "Friendly", "Casual", "Direct"]
+OUTREACH_OPTIONS = ["New", "Contacted", "Replied", "Meeting Booked", "Not Interested"]
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+SHEET_NAME = "Lead Gen Results"
+
+
+def get_creds_dict():
+    if not GCP_JSON_B64:
         return None
-
-
-def load_all_history():
-    items = []
     try:
-        for fname in os.listdir(HISTORY_DIR):
-            if not fname.endswith(".json"): continue
-            try:
-                with open(os.path.join(HISTORY_DIR, fname), "r", encoding="utf-8") as f:
-                    items.append(json.load(f))
-            except Exception: continue
-        items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-    except Exception: pass
-    return items
+        raw = base64.b64decode(GCP_JSON_B64).decode("utf-8")
+        return json.loads(raw)
+    except Exception:
+        try:
+            return json.loads(GCP_JSON_B64)
+        except Exception:
+            return None
 
 
-def delete_history(sid):
+def get_gsheet():
     try:
-        p = os.path.join(HISTORY_DIR, f"{sid}.json")
-        if os.path.exists(p): os.remove(p)
-        return True
-    except Exception: return False
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+        creds_dict = get_creds_dict()
+        if not creds_dict:
+            return None, "No credentials"
+        scope = ["https://spreadsheets.google.com/feeds",
+                 "https://www.googleapis.com/auth/drive"]
+        c = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        gc = gspread.authorize(c)
+        try:
+            sh = gc.open(SHEET_NAME)
+        except gspread.SpreadsheetNotFound:
+            sh = gc.create(SHEET_NAME)
+        return sh.sheet1, None
+    except Exception as e:
+        return None, str(e)[:100]
 
 
-def clear_all_history():
+def save_to_sheet(df, tab_name=None):
+    """
+    Save DataFrame to a NEW tab in the sheet.
+    If tab_name is given, uses it. Otherwise creates a timestamped name.
+    """
     try:
-        for f in os.listdir(HISTORY_DIR):
-            if f.endswith(".json"): os.remove(os.path.join(HISTORY_DIR, f))
-        return True
-    except Exception: return False
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+        creds_dict = get_creds_dict()
+        if not creds_dict:
+            return False, "No credentials"
+
+        scope = ["https://spreadsheets.google.com/feeds",
+                 "https://www.googleapis.com/auth/drive"]
+        c = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        gc = gspread.authorize(c)
+
+        try:
+            sh = gc.open(SHEET_NAME)
+        except gspread.SpreadsheetNotFound:
+            return False, f"Sheet '{SHEET_NAME}' not found. Please share it with the service account."
+
+        # Create timestamped tab name if not given
+        if not tab_name:
+            tab_name = "Search-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        # Sanitize tab name (Google Sheets doesn't allow: [ ] * / \ ? :)
+        tab_name = re.sub(r"[\[\]\*/\\?:]", "-", tab_name)[:100]
+
+        # Check if tab exists; if not, create it
+        try:
+            ws = sh.worksheet(tab_name)
+            ws.clear()
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=tab_name, rows=1000, cols=40)
+
+        safe_df = df.fillna("").astype(str)
+        ws.update([safe_df.columns.values.tolist()] + safe_df.values.tolist())
+
+        # Return the URL of this specific tab
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/edit#gid={ws.id}"
+        return True, f"Saved {len(df)} leads to tab '{tab_name}' → {sheet_url}"
+    except Exception as e:
+        return False, f"Sheet error: {str(e)[:200]}"
+
+
+def load_from_sheet():
+    ws, err = get_gsheet()
+    if ws is None:
+        return pd.DataFrame(columns=COLUMNS)
+    try:
+        data = ws.get_all_values()
+        if not data or len(data) < 2:
+            return pd.DataFrame(columns=COLUMNS)
+        header = data[0]
+        rows = data[1:]
+        df = pd.DataFrame(rows, columns=header)
+        for c in COLUMNS:
+            if c not in df.columns:
+                df[c] = ""
+        return df
+    except Exception:
+        return pd.DataFrame(columns=COLUMNS)
 
 
 def build_previous_leads_index():
@@ -158,216 +238,28 @@ def mark_duplicates(df, prev_index):
     return df
 
 
-# ============================================================
-# COLUMNS
-# ============================================================
-COLUMNS = [
-    "Business Name", "Business Category", "Lead Score", "AI Summary",
-    "Phone Number", "Email", "Website",
-    "Street Address", "City", "State", "ZIP Code", "Country",
-    "Google Maps URL", "Rating", "Review Count",
-    "Facebook Page", "Instagram", "LinkedIn Company URL", "YouTube", "Twitter",
-    "Executive Name", "Executive Title", "Executive LinkedIn",
-    "Executive Email", "Email Pattern", "Executive Source",
-    "Source URL",
-    "Audit Score", "Audit Grade", "Issues", "Pitch Angle",
-    "Duplicate", "First Seen"
-]
-
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-]
-
-EMAIL_TEMPLATES = {
-    "Cold Intro": "Short personalized cold outreach. Mention industry + something from AI summary. Under 120 words. Soft CTA for 15-min call.",
-    "Follow-up": "Polite follow-up. Reference previous message, restate value briefly, gently ask if interested. Under 100 words.",
-    "LinkedIn Message": "Short LinkedIn connection message (<300 chars). Friendly, mention industry, end with soft question.",
-    "Partnership Pitch": "Partnership pitch. Explain mutual benefits, reference business + industry, suggest short call. Under 150 words.",
-    "Re-engagement": "Re-engage a past contact who went quiet. Warm but not pushy. Mention something new. Under 100 words.",
-}
-
-TONES = ["Professional", "Friendly", "Casual", "Direct"]
-
-
-# ============================================================
-# SEARCH LAYER
-# ============================================================
-def ddg_web_search(query, max_results=10):
-    results = []
-    if not DDGS_OK: return results
+def save_history(industry, location, keywords, df):
     try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({"title": r.get("title",""),
-                                "href": r.get("href",""),
-                                "body": r.get("body","")})
+        sid = str(uuid.uuid4())[:8]
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        data = {"id": sid, "timestamp": ts, "industry": industry,
+                "location": location, "keywords": keywords,
+                "lead_count": len(df), "leads": df.to_dict(orient="records")}
+        with open(os.path.join(HISTORY_DIR, f"{sid}.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception: pass
-    return results
-
-
-def google_web_search(query, max_results=10):
-    global GOOGLE_BLOCKED_UNTIL
-    results = []
-    if not GOOGLE_OK: return results
-    if time.time() < GOOGLE_BLOCKED_UNTIL:
-        return results
-    try:
-        for url in google_search(query, num_results=max_results, lang="en",
-                                  region="us", sleep_interval=3, advanced=False):
-            results.append({"title": "", "href": url, "body": ""})
-            if len(results) >= max_results: break
-    except Exception as e:
-        msg = str(e)
-        if "429" in msg or "Too Many Requests" in msg or "sorry/index" in msg:
-            GOOGLE_BLOCKED_UNTIL = time.time() + 600
-    return results
-
-
-def bing_web_search(query, max_results=10):
-    results = []
-    try:
-        url = f"https://www.bing.com/search?q={quote_plus(query)}&count={max_results}"
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if r.status_code != 200: return results
-        soup = BeautifulSoup(r.text, "lxml")
-        for li in soup.select("li.b_algo")[:max_results]:
-            a = li.find("a", href=True)
-            if not a: continue
-            title = a.get_text(strip=True)
-            href = a["href"]
-            snippet_tag = li.find("p")
-            body = snippet_tag.get_text(strip=True) if snippet_tag else ""
-            if href.startswith("http"):
-                results.append({"title": title, "href": href, "body": body})
-    except Exception: pass
-    return results
-
-
-def web_search(query, max_results=10):
-    qkey = query.strip().lower()
-    if qkey in SEARCH_CACHE:
-        return SEARCH_CACHE[qkey][:max_results]
-    results = []
-    _throttle()
-    results = ddg_web_search(query, max_results)
-    if results:
-        SEARCH_CACHE[qkey] = results
-        return results
-    _throttle()
-    results = bing_web_search(query, max_results)
-    if results:
-        SEARCH_CACHE[qkey] = results
-        return results
-    _throttle()
-    results = google_web_search(query, max_results)
-    SEARCH_CACHE[qkey] = results
-    return results
-
-
-def multi_search(industry, location, target):
-    queries = [
-        f"{industry} in {location}",
-        f"best {industry} {location}",
-        f"top {industry} companies {location} contact",
-        f"{industry} {location} phone number address",
-        f"{industry} near {location} website",
-    ]
-    all_r, seen = [], set()
-    for q in queries:
-        if len(all_r) >= target * 3: break
-        for r in web_search(q, max_results=10):
-            if r.get("href") and r["href"] not in seen:
-                seen.add(r["href"]); all_r.append(r)
-        time.sleep(0.5)
-    return all_r
-
-
-PROMPT = """You are a lead data extractor. Return ONLY a JSON object.
-
-Industry: {industry}
-Location: {location}
-Keywords (optional): {keywords}
-
-RULES:
-1. Extract EVERY distinct business.
-2. Never invent data. Use "" if a field is missing.
-3. Return UP TO {limit} businesses.
-4. "Lead Score" = INTEGER 1-10 as string.
-5. "AI Summary" = 1 short sentence (max 20 words).
-
-Return JSON with key "leads" → array of objects with these keys:
-"Business Name", "Business Category", "Lead Score", "AI Summary",
-"Phone Number", "Email", "Website",
-"Street Address", "City", "State", "ZIP Code", "Country",
-"Google Maps URL", "Rating", "Review Count",
-"Facebook Page", "Instagram", "LinkedIn Company URL", "YouTube", "Twitter",
-"Source URL"
-
-Search results:
-{results}
-"""
-
-
-def call_groq(prompt, json_mode=False, temperature=0.1):
-    last_err = None
-    for model in GROQ_MODELS:
-        try:
-            kwargs = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                      "temperature": temperature}
-            if json_mode: kwargs["response_format"] = {"type": "json_object"}
-            return client.chat.completions.create(**kwargs).choices[0].message.content.strip()
-        except Exception as e:
-            last_err = f"{model}: {e}"; continue
-    raise RuntimeError(f"All Groq models failed. Last: {last_err}")
-
-
-def extract_leads(industry, location, keywords, results, limit):
-    if not results: return []
-    trimmed = results[:20]
-    rtext = "\n\n".join(f"Title: {r['title']}\nURL: {r['href']}\nSnippet: {r['body']}"
-                        for r in trimmed)
-    prompt = PROMPT.format(industry=industry, location=location,
-                           keywords=keywords or "None", limit=limit, results=rtext)
-    for jm in (True, False):
-        try:
-            text = call_groq(prompt, json_mode=jm)
-            text = re.sub(r"^```(json)?", "", text).strip()
-            text = re.sub(r"```$", "", text).strip()
-            parsed = json.loads(text)
-            data = (parsed.get("leads") or parsed.get("Leads") or []) if isinstance(parsed, dict) else parsed
-            if data: return data
-        except Exception as e:
-            st.warning(f"Extract attempt failed: {e}"); continue
-    st.error("Could not extract any leads.")
-    return []
 
 
 # ============================================================
-# HELPERS — URL CLEANING + COUNTRY DETECTION
+# HELPERS
 # ============================================================
-SOCIAL_PATTERNS = {
-    "Facebook":  r"(?:facebook\.com|fb\.com)/([A-Za-z0-9._\-/]+)",
-    "Instagram": r"instagram\.com/([A-Za-z0-9._\-/]+)",
-    "LinkedIn":  r"linkedin\.com/(?:company|in)/([A-Za-z0-9._\-/]+)",
-    "YouTube":   r"youtube\.com/(?:c/|channel/|user/|@)?([A-Za-z0-9._\-/]+)",
-    "Twitter":   r"(?:twitter\.com|x\.com)/([A-Za-z0-9._\-/]+)",
-}
 PHONE_REGEX = re.compile(r"(?:\+?1[\s\-.]?)?\(?\b([2-9]\d{2})\)?[\s\-.]?(\d{3})[\s\-.]?(\d{4})\b")
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 JUNK_EMAILS = ["example", "sentry", "yourdomain", "@2x", ".png", ".jpg", ".jpeg",
-               ".gif", ".webp", "wixpress", "sentry.io", "w3.org"]
+               ".gif", ".webp", "wixpress", "sentry.io", "w3.org", "domain.com",
+               "email.com", "yourname", "noreply", "no-reply", "info@example"]
 
-TITLE_KEYWORDS = [
-    "owner", "co-owner", "founder", "co-founder", "ceo", "chief executive",
-    "president", "managing director", "director", "manager", "general manager",
-    "partner", "principal", "proprietor", "head of", "vp", "vice president",
-    "cmo", "cfo", "coo", "cto", "medical director", "practice manager",
-]
-
-# ---- Facebook URL cleaning ----
 FB_JUNK_SEGMENTS = {
     "sharer", "sharer.php", "plugins", "login", "login.php", "dialog",
     "tr", "profile.php", "pages", "events", "groups", "photo.php",
@@ -377,51 +269,35 @@ FB_JUNK_SEGMENTS = {
 
 
 def clean_facebook_url(url):
-    """
-    Return a canonical Facebook business page URL or ''.
-    Strips share links, plugins, login redirects, and query params.
-    """
     if not url: return ""
     try:
-        # Strip query params first
         url = url.split("?")[0].split("#")[0]
         p = urlparse(url)
         path = p.path.strip("/")
         if not path: return ""
-
         first_seg = path.split("/")[0].lower()
-        if first_seg in FB_JUNK_SEGMENTS:
-            return ""
-
-        # Keep only /pagename or /pagename/subsection
+        if first_seg in FB_JUNK_SEGMENTS: return ""
         parts = [seg for seg in path.split("/") if seg and seg.lower() not in FB_JUNK_SEGMENTS]
         if not parts: return ""
-
-        # Facebook page handles are typically 3-60 chars, no dots or spaces
         handle = parts[0]
         if len(handle) < 3 or len(handle) > 60: return ""
         if "." in handle or " " in handle: return ""
-        # Common junk
         if handle.lower() in ("home", "welcome", "index", "en", "us"): return ""
-
         return f"https://www.facebook.com/{handle}"
     except Exception:
         return ""
 
 
 def clean_linkedin_company_url(url):
-    """Return a canonical LinkedIn company URL or '' (rejects profile URLs)."""
     if not url: return ""
     try:
         url = url.split("?")[0].split("#")[0]
         p = urlparse(url)
         path = p.path.strip("/")
-        # Prefer /company/xyz
         m = re.match(r"company/([A-Za-z0-9\-_%]+)", path, re.IGNORECASE)
         if m:
-            handle = m.group(1)
-            if len(handle) > 1:
-                return f"https://www.linkedin.com/company/{handle}"
+            h = m.group(1)
+            if len(h) > 1: return f"https://www.linkedin.com/company/{h}"
         return ""
     except Exception:
         return ""
@@ -443,29 +319,19 @@ def clean_instagram_url(url):
         return ""
 
 
-# ---- Country detection ----
 COUNTRY_HINTS = {
-    "united states": ["usa", "united states", "u.s.a", "us"],
-    "united kingdom": ["uk", "united kingdom", "england", "scotland", "wales", "great britain"],
-    "canada": ["canada", "ca"],
-    "australia": ["australia", "au"],
-    "india": ["india", "in"],
-    "pakistan": ["pakistan", "pk"],
-    "germany": ["germany", "de", "deutschland"],
-    "france": ["france", "fr"],
-    "spain": ["spain", "es", "españa"],
-    "italy": ["italy", "it", "italia"],
-    "netherlands": ["netherlands", "nl", "holland"],
-    "uae": ["uae", "united arab emirates", "dubai", "abu dhabi"],
-    "saudi arabia": ["saudi arabia", "ksa", "saudi"],
-    "singapore": ["singapore", "sg"],
-    "japan": ["japan", "jp"],
-    "china": ["china", "cn"],
-    "brazil": ["brazil", "br", "brasil"],
-    "mexico": ["mexico", "mx", "méxico"],
-    "new zealand": ["new zealand", "nz"],
-    "ireland": ["ireland", "ie"],
-    "south africa": ["south africa", "za"],
+    "united states": ["usa","united states","u.s.a","us"],
+    "united kingdom": ["uk","united kingdom","england","scotland","wales","great britain"],
+    "canada": ["canada","ca"], "australia": ["australia","au"],
+    "india": ["india","in"], "pakistan": ["pakistan","pk"],
+    "germany": ["germany","de"], "france": ["france","fr"],
+    "spain": ["spain","es"], "italy": ["italy","it"],
+    "netherlands": ["netherlands","nl"], "uae": ["uae","dubai","abu dhabi"],
+    "saudi arabia": ["saudi"], "singapore": ["singapore","sg"],
+    "japan": ["japan","jp"], "china": ["china","cn"],
+    "brazil": ["brazil","br"], "mexico": ["mexico","mx"],
+    "new zealand": ["new zealand","nz"], "ireland": ["ireland","ie"],
+    "south africa": ["south africa","za"],
 }
 
 US_STATES = {
@@ -477,93 +343,52 @@ US_STATES = {
 
 
 def detect_country(lead):
-    """
-    Detect country using multiple signals:
-    1. Explicit Country field
-    2. State abbreviation (US)
-    3. ZIP code format (US: 5 digits)
-    4. Phone prefix
-    5. Domain TLD
-    6. AI summary text
-    """
     try:
-        # 1. Explicit
         c = str(lead.get("Country", "")).strip()
         if c:
             for known, aliases in COUNTRY_HINTS.items():
                 if c.lower() in aliases or c.lower() == known:
                     return known.title()
-
-        # 2. State = US abbreviation
         state = str(lead.get("State", "")).strip().upper()
-        if state in US_STATES:
-            return "United States"
-
-        # 3. ZIP = 5 digits → US
+        if state in US_STATES: return "United States"
         zipc = str(lead.get("ZIP Code", "")).strip()
-        if re.match(r"^\d{5}(-\d{4})?$", zipc):
-            return "United States"
-
-        # 4. Phone prefix
+        if re.match(r"^\d{5}(-\d{4})?$", zipc): return "United States"
         phone = str(lead.get("Phone Number", "")).strip()
         if phone and phone != "N/A":
             d = re.sub(r"\D", "", phone)
-            if d.startswith("1") and len(d) == 11:
-                return "United States"
+            if d.startswith("1") and len(d) == 11: return "United States"
             if d.startswith("44"): return "United Kingdom"
             if d.startswith("91"): return "India"
             if d.startswith("92"): return "Pakistan"
             if d.startswith("61"): return "Australia"
-            if d.startswith("49"): return "Germany"
-            if d.startswith("33"): return "France"
-            if d.startswith("86"): return "China"
-            if d.startswith("81"): return "Japan"
-            if d.startswith("65"): return "Singapore"
             if d.startswith("971"): return "UAE"
-
-        # 5. Domain TLD
         website = str(lead.get("Website", "")).strip()
         if website:
             tld = urlparse(website).netloc.rsplit(".", 1)[-1].lower()
-            tld_map = {
-                "uk": "United Kingdom", "ca": "Canada", "au": "Australia",
-                "in": "India", "pk": "Pakistan", "de": "Germany",
-                "fr": "France", "es": "Spain", "it": "Italy",
-                "nl": "Netherlands", "ae": "UAE", "sa": "Saudi Arabia",
-                "sg": "Singapore", "jp": "Japan", "cn": "China",
-                "br": "Brazil", "mx": "Mexico", "nz": "New Zealand",
-                "ie": "Ireland", "za": "South Africa",
-            }
-            if tld in tld_map:
-                return tld_map[tld]
-
-        # 6. AI summary text
-        summary = (str(lead.get("AI Summary", "")) + " " + str(lead.get("Street Address", ""))).lower()
-        for known, aliases in COUNTRY_HINTS.items():
-            for a in aliases:
-                if re.search(rf"\b{re.escape(a)}\b", summary):
-                    return known.title()
-
-    except Exception:
-        pass
+            tld_map = {"uk":"United Kingdom","ca":"Canada","au":"Australia","in":"India",
+                       "pk":"Pakistan","de":"Germany","fr":"France","es":"Spain","it":"Italy",
+                       "nl":"Netherlands","ae":"UAE","sa":"Saudi Arabia","sg":"Singapore",
+                       "jp":"Japan","cn":"China","br":"Brazil","mx":"Mexico","nz":"New Zealand",
+                       "ie":"Ireland","za":"South Africa"}
+            if tld in tld_map: return tld_map[tld]
+    except Exception: pass
     return ""
 
 
 def safe_get(url, timeout=8):
     try:
-        return requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        return requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]},
+                            timeout=timeout, allow_redirects=True)
     except Exception:
         return None
 
 
 def domain_from_url(url):
     try:
-        p = urlparse(url)
-        d = p.netloc.lower()
+        p = urlparse(url); d = p.netloc.lower()
         if d.startswith("www."): d = d[4:]
         return d
-    except Exception:
-        return ""
+    except Exception: return ""
 
 
 def extract_jsonld(soup):
@@ -572,14 +397,17 @@ def extract_jsonld(soup):
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 obj = json.loads(script.string or "")
-            except Exception:
-                continue
+            except Exception: continue
             items = obj if isinstance(obj, list) else [obj]
             for item in items:
                 if not isinstance(item, dict): continue
                 t = item.get("@type", "")
+                if isinstance(t, list): t = t[0] if t else ""
                 if t in ("LocalBusiness", "Organization", "Store", "MedicalBusiness",
-                         "HealthAndBeautyBusiness", "ProfessionalService", "Restaurant"):
+                         "HealthAndBeautyBusiness", "ProfessionalService", "Restaurant",
+                         "HomeAndConstructionBusiness", "GeneralContractor",
+                         "RoofingContractor", "Electrician", "Plumber", "HousePainter",
+                         "MovingCompany", "Locksmith"):
                     addr = item.get("address", {})
                     if isinstance(addr, dict):
                         data.setdefault("Street Address", addr.get("streetAddress", ""))
@@ -616,12 +444,6 @@ def extract_jsonld(soup):
                             data.setdefault("YouTube", same)
                         elif "twitter.com" in low or "x.com" in low:
                             data.setdefault("Twitter", same)
-                    if item.get("founder"):
-                        f = item["founder"]
-                        if isinstance(f, dict):
-                            data.setdefault("_exec_name", f.get("name", ""))
-                        elif isinstance(f, str):
-                            data.setdefault("_exec_name", f)
     except Exception: pass
     return data
 
@@ -629,8 +451,6 @@ def extract_jsonld(soup):
 def extract_contacts_from_html(html, base_url):
     result = {}
     soup = BeautifulSoup(html, "lxml")
-
-    # tel: and mailto: links
     for a in soup.find_all("a", href=True):
         h = a["href"]
         if h.startswith("tel:"):
@@ -641,11 +461,8 @@ def extract_contacts_from_html(html, base_url):
             e = h[7:].split("?")[0].strip()
             if EMAIL_REGEX.match(e) and not any(x in e.lower() for x in JUNK_EMAILS):
                 result.setdefault("Email", e)
-
-    # Social links with cleanup
     for a in soup.find_all("a", href=True):
-        h = a["href"]
-        low = h.lower()
+        h = a["href"]; low = h.lower()
         if "facebook.com" in low or "fb.com" in low:
             cl = clean_facebook_url(h if h.startswith("http") else urljoin(base_url, h))
             if cl: result.setdefault("Facebook Page", cl)
@@ -661,19 +478,13 @@ def extract_contacts_from_html(html, base_url):
         elif "twitter.com" in low or "x.com" in low:
             full = h if h.startswith("http") else urljoin(base_url, h)
             result.setdefault("Twitter", full)
-
-    # <address> tag
     addr = soup.find("address")
     if addr:
         t = addr.get_text(separator=" ", strip=True)
         if len(t) > 10: result.setdefault("_address_block", t)
-
-    # JSON-LD
     jsonld = extract_jsonld(soup)
     for k, v in jsonld.items():
         if v and k not in result: result[k] = v
-
-    # Text fallbacks
     page_text = soup.get_text(separator=" ", strip=True)
     if "Phone Number" not in result:
         phones = PHONE_REGEX.findall(page_text)
@@ -683,93 +494,138 @@ def extract_contacts_from_html(html, base_url):
         emails = [e for e in EMAIL_REGEX.findall(page_text)
                   if not any(x in e.lower() for x in JUNK_EMAILS)]
         if emails: result["Email"] = emails[0]
-
-    # Google Maps
     for a in soup.find_all("a", href=True):
         if "google.com/maps" in a["href"] or "maps.google" in a["href"]:
             result.setdefault("Google Maps URL", a["href"]); break
-
     return result
 
 
 # ============================================================
 # EXECUTIVE FINDER
 # ============================================================
+TITLE_KEYWORDS = [
+    "owner", "co-owner", "founder", "co-founder", "ceo", "chief executive",
+    "president", "managing director", "director", "general manager",
+    "partner", "principal", "proprietor", "medical director", "practice manager",
+    "manager", "cfo", "coo", "cto", "cmo", "vp", "vice president",
+]
+
+BAD_NAME_WORDS = {
+    "the", "and", "our", "your", "their", "his", "her", "it", "this", "that",
+    "at", "in", "on", "of", "for", "with", "by", "to", "from",
+    "construction", "company", "corporation", "corp", "inc", "llc",
+    "services", "service", "group", "solution", "solutions",
+    "building", "general", "contractor", "contracting", "roofing",
+    "plumbing", "electrical", "painting", "concrete", "remodeling",
+    "about", "contact", "home", "more", "learn", "click", "here",
+    "privacy", "policy", "terms", "cookie", "read", "view", "see",
+    "welcome", "hello", "team", "staff", "people", "meet",
+    "restaurant", "cafe", "kitchen", "food", "diner", "bar", "grill",
+}
+
+
+def is_valid_name(name):
+    if not name: return False
+    words = name.strip().split()
+    if len(words) < 2 or len(words) > 4: return False
+    for w in words:
+        lw = w.lower()
+        if lw in BAD_NAME_WORDS: return False
+        if not re.match(r"^[A-Z][a-zA-Z'\-]+$", w): return False
+        if len(w) < 2: return False
+    return True
+
+
 def find_executives_from_html(html, base_url):
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(separator=" ", strip=True)
+    text = soup.get_text(separator="\n", strip=True)
     executives = []
-
-    for kw in TITLE_KEYWORDS:
-        pattern = re.compile(
-            rf"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){{1,2}})\s*[,\-–|]\s*([A-Za-z\s]{{2,40}}?{kw}[A-Za-z\s]{{0,20}})",
-            re.IGNORECASE
-        )
-        for match in pattern.finditer(text):
-            name = match.group(1).strip()
-            title = match.group(2).strip()
-            if len(name.split()) < 2 or len(name) > 40: continue
-            if any(x in name.lower() for x in ["privacy", "policy", "terms", "cookie"]): continue
-            executives.append({"name": name, "title": title.title(), "source": base_url})
-            if len(executives) >= 5: break
+    name_pat = re.compile(
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z'\-]+){1,2})\s*[,\-–|]\s*([A-Za-z\s]{2,40})",
+        re.MULTILINE
+    )
+    for match in name_pat.finditer(text):
+        name = match.group(1).strip()
+        title = match.group(2).strip()
+        if not is_valid_name(name): continue
+        for kw in TITLE_KEYWORDS:
+            if kw in title.lower():
+                executives.append({"name": name, "title": kw.title(), "source": base_url})
+                break
         if len(executives) >= 5: break
-
-    if not executives:
-        for kw in ["founder", "ceo", "owner", "president"]:
-            p = re.compile(rf"{kw}[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)", re.IGNORECASE)
-            for m in p.finditer(text):
-                executives.append({"name": m.group(1), "title": kw.title(), "source": base_url})
-                if len(executives) >= 3: break
-            if executives: break
-    return executives
+    seen = set(); result = []
+    for e in executives:
+        key = e["name"].lower()
+        if key not in seen:
+            seen.add(key); result.append(e)
+    return result
 
 
 def google_search_executive(business_name, city="", state=""):
+    """Improved - searches multiple angles."""
     if not business_name: return {}
     info = {}
-    q1 = f'"{business_name}" (CEO OR Founder OR Owner OR President OR Manager)'
+
+    # Query 1: General exec search
+    q1 = f'"{business_name}" (CEO OR Founder OR Owner OR President)'
     if city: q1 += f" {city}"
-    results = web_search(q1, max_results=5)
+    results = web_search(q1, max_results=8)
     combined = " ".join([f"{r.get('title','')} {r.get('body','')}" for r in results])
 
     for kw in ["CEO", "Founder", "Co-Founder", "Owner", "President",
-               "Managing Director", "Director", "Manager", "Partner"]:
-        pat = re.compile(rf"([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[,\-–]\s*{kw}", re.IGNORECASE)
+               "Managing Director", "Director", "Partner", "Head Chef"]:
+        pat = re.compile(
+            rf"([A-Z][a-z]+(?:\s+[A-Z][a-z'\-]+){{1,2}})\s*[,\-–]\s*{kw}\b",
+            re.IGNORECASE
+        )
         m = pat.search(combined)
         if m:
-            info["Executive Name"] = m.group(1).strip()
-            info["Executive Title"] = kw.title()
-            break
-    if "Executive Name" not in info:
-        for kw in ["CEO", "Founder", "Owner", "President"]:
-            pat = re.compile(rf"{kw}\s+([A-Z][a-z]+\s+[A-Z][a-z]+)", re.IGNORECASE)
-            m = pat.search(combined)
-            if m:
-                info["Executive Name"] = m.group(1).strip()
+            nm = m.group(1).strip()
+            if is_valid_name(nm):
+                info["Executive Name"] = nm
                 info["Executive Title"] = kw.title()
                 break
 
+    # Query 2: LinkedIn profile search
     q2 = f'"{business_name}" site:linkedin.com/in'
     if city: q2 += f" {city}"
-    li_results = web_search(q2, max_results=3)
-    for r in li_results:
+    for r in web_search(q2, max_results=5):
         href = r.get("href", "")
         if "linkedin.com/in/" in href:
             info["Executive LinkedIn"] = href
             title = r.get("title", "")
-            m = re.match(r"([A-Z][a-z]+\s+[A-Z][a-z]+)", title)
+            m = re.match(r"([A-Z][a-z]+\s+[A-Z][a-z'\-]+)", title)
             if m and "Executive Name" not in info:
-                info["Executive Name"] = m.group(1)
+                nm = m.group(1)
+                if is_valid_name(nm):
+                    info["Executive Name"] = nm
             break
+
+    # Query 3: Company website "team/about" search
+    if "Executive Name" not in info:
+        q3 = f'"{business_name}" (team OR about OR leadership OR owners)'
+        if city: q3 += f" {city}"
+        results3 = web_search(q3, max_results=5)
+        for r in results3:
+            href = r.get("href", "")
+            if href and "linkedin" not in href:
+                # Try fetching the page and extracting execs
+                resp = safe_get(href, timeout=8)
+                if resp and resp.status_code == 200:
+                    execs = find_executives_from_html(resp.text, href)
+                    if execs:
+                        top = execs[0]
+                        if is_valid_name(top["name"]):
+                            info["Executive Name"] = top["name"]
+                            info["Executive Title"] = top["title"]
+                            info["Executive Source"] = href
+                        break
     return info
 
 
 def find_company_socials(business_name, city="", state=""):
-    """Search for the official Facebook + LinkedIn company URLs."""
     result = {}
     if not business_name: return result
-
-    # Facebook
     q_fb = f'"{business_name}" facebook'
     if city: q_fb += f" {city}"
     for r in web_search(q_fb, max_results=4):
@@ -779,8 +635,6 @@ def find_company_socials(business_name, city="", state=""):
             if cl:
                 result["Facebook Page"] = cl
                 break
-
-    # LinkedIn company
     q_li = f'"{business_name}" site:linkedin.com/company'
     if city: q_li += f" {city}"
     for r in web_search(q_li, max_results=4):
@@ -790,7 +644,6 @@ def find_company_socials(business_name, city="", state=""):
             if cl:
                 result["LinkedIn Company URL"] = cl
                 break
-
     return result
 
 
@@ -801,20 +654,12 @@ def detect_email_pattern(domain, business_name):
     combined = " ".join([f"{r.get('title','')} {r.get('body','')}" for r in results])
     emails = [e for e in EMAIL_REGEX.findall(combined)
               if domain in e.lower() and not any(x in e.lower() for x in JUNK_EMAILS)]
-    pattern = ""
+    pattern = "{first}"
     if emails:
-        sample = emails[0]
-        local = sample.split("@")[0].lower()
-        if "." in local and local.count(".") == 1:
-            pattern = "{first}.{last}"
-        elif local.isalpha() and len(local) > 3:
-            pattern = "{first}"
-        elif len(local) == 1:
-            pattern = "{f}{last}"
-        else:
-            pattern = "{first}"
-    else:
-        pattern = "{first}"
+        local = emails[0].split("@")[0].lower()
+        if "." in local and local.count(".") == 1: pattern = "{first}.{last}"
+        elif local.isalpha() and len(local) > 3: pattern = "{first}"
+        elif len(local) == 1: pattern = "{f}{last}"
     return pattern, emails[0] if emails else ""
 
 
@@ -825,19 +670,348 @@ def infer_email(pattern, name, domain):
     first = re.sub(r"[^a-z]", "", parts[0].lower())
     last = re.sub(r"[^a-z]", "", parts[-1].lower())
     f = first[0] if first else ""
-    try:
-        local = pattern.format(first=first, last=last, f=f)
-    except Exception:
-        local = first
+    try: local = pattern.format(first=first, last=last, f=f)
+    except Exception: local = first
     return f"{local}@{domain}"
 
 
 # ============================================================
-# WEBSITE RESEARCH
+# OVERPASS
+# ============================================================
+OVERPASS_ENDPOINTS = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+
+INDUSTRY_TAG_MAP = {
+    "restaurant": [("amenity", "restaurant"), ("amenity", "fast_food")],
+    "cafe": [("amenity", "cafe")],
+    "coffee": [("amenity", "cafe")],
+    "bar": [("amenity", "bar"), ("amenity", "pub")],
+    "pub": [("amenity", "pub")],
+    "hotel": [("tourism", "hotel")],
+    "dentist": [("amenity", "dentist"), ("healthcare", "dentist")],
+    "doctor": [("amenity", "doctors"), ("healthcare", "doctor")],
+    "hospital": [("amenity", "hospital")],
+    "clinic": [("amenity", "clinic")],
+    "pharmacy": [("amenity", "pharmacy")],
+    "veterinary": [("amenity", "veterinary")],
+    "vet": [("amenity", "veterinary")],
+    "gym": [("leisure", "fitness_centre")],
+    "fitness": [("leisure", "fitness_centre")],
+    "yoga": [("leisure", "fitness_centre")],
+    "salon": [("shop", "beauty"), ("shop", "hairdresser")],
+    "hair": [("shop", "hairdresser")],
+    "barber": [("shop", "hairdresser")],
+    "spa": [("leisure", "spa"), ("shop", "beauty")],
+    "beauty": [("shop", "beauty")],
+    "bank": [("amenity", "bank")],
+    "supermarket": [("shop", "supermarket")],
+    "grocery": [("shop", "supermarket"), ("shop", "convenience")],
+    "bakery": [("shop", "bakery")],
+    "clothing": [("shop", "clothes")],
+    "shoes": [("shop", "shoes")],
+    "jewelry": [("shop", "jewelry")],
+    "furniture": [("shop", "furniture")],
+    "electronics": [("shop", "electronics")],
+    "hardware": [("shop", "hardware"), ("shop", "doityourself")],
+    "construction": [("office", "company"), ("craft", "builder")],
+    "contractor": [("office", "company"), ("craft", "builder")],
+    "builder": [("craft", "builder")],
+    "plumber": [("craft", "plumber")],
+    "electrician": [("craft", "electrician")],
+    "roofer": [("craft", "roofer")],
+    "painter": [("craft", "painter")],
+    "carpenter": [("craft", "carpenter")],
+    "lawyer": [("office", "lawyer")],
+    "attorney": [("office", "lawyer")],
+    "accountant": [("office", "accountant")],
+    "insurance": [("office", "insurance")],
+    "real estate": [("office", "estate_agent")],
+    "architect": [("office", "architect")],
+    "engineer": [("office", "engineer")],
+    "travel": [("office", "travel_agent")],
+    "car repair": [("shop", "car_repair")],
+    "auto repair": [("shop", "car_repair")],
+    "car dealer": [("shop", "car")],
+    "gas": [("amenity", "fuel")],
+    "laundry": [("shop", "laundry")],
+    "florist": [("shop", "florist")],
+    "bookstore": [("shop", "books")],
+    "school": [("amenity", "school")],
+    "university": [("amenity", "university")],
+    "library": [("amenity", "library")],
+    "cinema": [("amenity", "cinema")],
+    "museum": [("tourism", "museum")],
+}
+
+FALLBACK_TAGS = [("amenity", "restaurant")]
+
+
+def infer_osm_tags(industry):
+    if not industry: return FALLBACK_TAGS
+    low = industry.lower().strip()
+    for key, tags in INDUSTRY_TAG_MAP.items():
+        if key in low: return tags
+    words = re.split(r"\s+", low)
+    for w in words:
+        if w in INDUSTRY_TAG_MAP: return INDUSTRY_TAG_MAP[w]
+    return FALLBACK_TAGS
+
+
+def geocode_location(location):
+    try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": location, "format": "json", "limit": 1}
+        r = requests.get(url, params=params,
+                         headers={"User-Agent": "LeadGenApp/1.0"}, timeout=12)
+        if r.status_code != 200: return None
+        data = r.json()
+        if not data: return None
+        item = data[0]
+        if "boundingbox" in item:
+            south, north, west, east = item["boundingbox"]
+            return {"type": "bbox", "south": float(south), "north": float(north),
+                    "west": float(west), "east": float(east),
+                    "display_name": item.get("display_name", location)}
+        return None
+    except Exception:
+        return None
+
+
+def build_overpass_query(tags, bbox):
+    b = f"{bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']}"
+    parts = []
+    for key, val in tags:
+        parts.append(f'node["{key}"="{val}"]({b});')
+        parts.append(f'way["{key}"="{val}"]({b});')
+        parts.append(f'relation["{key}"="{val}"]({b});')
+    body = "\n".join(parts)
+    return f"""[out:json][timeout:180];
+(
+{body}
+);
+out center tags;"""
+
+
+def overpass_search(tags, bbox):
+    query = build_overpass_query(tags, bbox)
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            r = requests.post(endpoint, data={"data": query},
+                              headers={"User-Agent": "LeadGenApp/1.0",
+                                       "Content-Type": "application/x-www-form-urlencoded"},
+                              timeout=180)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if "elements" in data and len(data["elements"]) > 0:
+                        return data["elements"]
+                except Exception: continue
+        except Exception: continue
+    return []
+
+
+def parse_overpass_element(el, industry):
+    tags = el.get("tags", {}) or {}
+    name = (
+        tags.get("name") or
+        tags.get("name:en") or
+        tags.get("operator") or
+        tags.get("brand") or
+        ""
+    ).strip()
+
+    if not name:
+        return None
+    if re.match(r"^\d+$", name):
+        return None
+    if len(name) < 2:
+        return None
+
+    lat = el.get("lat")
+    lng = el.get("lon")
+    if lat is None or lng is None:
+        center = el.get("center") or {}
+        lat = center.get("lat"); lng = center.get("lon")
+
+    category = (tags.get("shop") or tags.get("amenity") or tags.get("office") or
+                tags.get("craft") or tags.get("leisure") or tags.get("tourism") or
+                industry).strip().replace("_", " ").title()
+
+    street_num = (tags.get("addr:housenumber") or "").strip()
+    street_name = (tags.get("addr:street") or "").strip()
+    street = f"{street_num} {street_name}".strip()
+    city = (tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village") or "").strip()
+    state = (tags.get("addr:state") or tags.get("addr:province") or "").strip()
+    zipc = (tags.get("addr:postcode") or "").strip()
+    country = (tags.get("addr:country") or "").strip()
+
+    phone = (tags.get("phone") or tags.get("contact:phone") or
+             tags.get("phone:mobile") or tags.get("contact:mobile") or
+             tags.get("mobile") or "").strip()
+
+    website = (tags.get("website") or tags.get("contact:website") or
+               tags.get("url") or "").strip()
+    if website and not website.startswith("http"):
+        website = "https://" + website.lstrip("/")
+
+    email = (tags.get("email") or tags.get("contact:email") or "").strip()
+    facebook = (tags.get("contact:facebook") or tags.get("facebook") or "").strip()
+    instagram = (tags.get("contact:instagram") or tags.get("instagram") or "").strip()
+    twitter = (tags.get("contact:twitter") or tags.get("twitter") or "").strip()
+    maps_url = f"https://www.google.com/maps?q={lat},{lng}" if lat and lng else ""
+
+    return {
+        "Business Name": name, "Business Category": category,
+        "Phone Number": phone, "Email": email, "Website": website,
+        "Street Address": street, "City": city, "State": state,
+        "ZIP Code": zipc, "Country": country, "Google Maps URL": maps_url,
+        "Facebook Page": clean_facebook_url(facebook) if facebook else "",
+        "Instagram": clean_instagram_url(instagram) if instagram else "",
+        "LinkedIn Company URL": "", "Twitter": twitter, "YouTube": "",
+        "Rating": "", "Review Count": "",
+        "Source URL": f"https://www.openstreetmap.org/{el.get('type','node')}/{el.get('id','')}",
+    }
+
+
+# ============================================================
+# SEARCH
+# ============================================================
+def ddg_web_search(query, max_results=10):
+    results = []
+    if not DDGS_OK: return results
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({"title": r.get("title",""),
+                                "href": r.get("href",""),
+                                "body": r.get("body","")})
+    except Exception: pass
+    return results
+
+
+def google_web_search(query, max_results=10):
+    global GOOGLE_BLOCKED_UNTIL
+    results = []
+    if not GOOGLE_OK: return results
+    if time.time() < GOOGLE_BLOCKED_UNTIL: return results
+    try:
+        for url in google_search(query, num_results=max_results, lang="en",
+                                  region="us", sleep_interval=3, advanced=False):
+            results.append({"title": "", "href": url, "body": ""})
+            if len(results) >= max_results: break
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "Too Many Requests" in msg or "sorry/index" in msg:
+            GOOGLE_BLOCKED_UNTIL = time.time() + 600
+    return results
+
+
+def bing_web_search(query, max_results=10):
+    results = []
+    try:
+        url = f"https://www.bing.com/search?q={quote_plus(query)}&count={max_results}"
+        r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=8)
+        if r.status_code != 200: return results
+        soup = BeautifulSoup(r.text, "lxml")
+        for li in soup.select("li.b_algo")[:max_results]:
+            a = li.find("a", href=True)
+            if not a: continue
+            href = a["href"]
+            snippet_tag = li.find("p")
+            body = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            if href.startswith("http"):
+                results.append({"title": a.get_text(strip=True), "href": href, "body": body})
+    except Exception: pass
+    return results
+
+
+def _throttle():
+    global LAST_CALL_TIME
+    elapsed = time.time() - LAST_CALL_TIME
+    if elapsed < 1.2:
+        time.sleep(1.2 - elapsed)
+    LAST_CALL_TIME = time.time()
+
+
+def web_search(query, max_results=10):
+    qkey = query.strip().lower()
+    if qkey in SEARCH_CACHE:
+        return SEARCH_CACHE[qkey][:max_results]
+    _throttle()
+    results = ddg_web_search(query, max_results)
+    if results:
+        SEARCH_CACHE[qkey] = results
+        return results
+    _throttle()
+    results = bing_web_search(query, max_results)
+    if results:
+        SEARCH_CACHE[qkey] = results
+        return results
+    _throttle()
+    results = google_web_search(query, max_results)
+    SEARCH_CACHE[qkey] = results
+    return results
+
+
+def call_groq(prompt, json_mode=False, temperature=0.1):
+    last_err = None
+    for model in GROQ_MODELS:
+        try:
+            kwargs = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": temperature}
+            if json_mode: kwargs["response_format"] = {"type": "json_object"}
+            return client.chat.completions.create(**kwargs).choices[0].message.content.strip()
+        except Exception as e:
+            last_err = f"{model}: {e}"; continue
+    raise RuntimeError(f"All Groq models failed. Last: {last_err}")
+
+
+def batch_ai_score(leads, batch_size=25):
+    results = []
+    for i in range(0, len(leads), batch_size):
+        batch = leads[i:i+batch_size]
+        lines = []
+        for idx, l in enumerate(batch):
+            lines.append(
+                f"{idx+1}. {l.get('Business Name','')} | {l.get('Business Category','')} | "
+                f"{l.get('City','')}, {l.get('State','')} | website:{'yes' if l.get('Website') else 'no'} | "
+                f"phone:{'yes' if l.get('Phone Number') else 'no'}"
+            )
+        listing = "\n".join(lines)
+        prompt = f"""Rate each business as a lead from 1 to 10 with a 1-sentence summary (max 20 words).
+
+{listing}
+
+Return ONLY JSON: {{"ratings": [{{"score": 8, "summary": "..."}}, ...]}} in the SAME order."""
+        try:
+            text = call_groq(prompt, json_mode=True, temperature=0.2)
+            text = re.sub(r"^```(json)?", "", text).strip()
+            text = re.sub(r"```$", "", text).strip()
+            data = json.loads(text)
+            ratings = data.get("ratings", [])
+            for j in range(len(batch)):
+                if j < len(ratings):
+                    results.append((str(ratings[j].get("score", "5")),
+                                    ratings[j].get("summary", "")))
+                else:
+                    results.append(("5", ""))
+        except Exception:
+            for _ in batch:
+                results.append(("5", ""))
+    while len(results) < len(leads):
+        results.append(("5", ""))
+    return results[:len(leads)]
+
+
+# ============================================================
+# ENRICHMENT
 # ============================================================
 CONTACT_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
-TEAM_PATHS = ["/team", "/our-team", "/staff", "/leadership", "/management",
-              "/about/team", "/owners", "/meet-the-team"]
+TEAM_PATHS = ["/team", "/our-team", "/staff", "/leadership", "/management"]
 
 
 def research_website(url):
@@ -853,10 +1027,7 @@ def research_website(url):
         info = extract_contacts_from_html(resp.text, target)
         for k, v in info.items():
             if v and k not in collected: collected[k] = v
-        important = ["Phone Number", "Email", "Street Address", "Facebook Page",
-                     "Instagram", "LinkedIn Company URL"]
-        if all(k in collected for k in important): break
-        time.sleep(0.3)
+        time.sleep(0.2)
     return collected
 
 
@@ -873,140 +1044,51 @@ def find_executives(url):
             if not any(x["name"].lower() == e["name"].lower() for x in all_execs):
                 all_execs.append(e)
         if len(all_execs) >= 3: break
-        time.sleep(0.3)
+        time.sleep(0.2)
     return all_execs
 
 
-def google_search_fallback(business_name, city, state):
-    result = {}
-    if not business_name: return result
-    q = f'"{business_name}" {city} {state} (phone OR contact OR email OR address)'.strip()
-    results = web_search(q, max_results=5)
-    combined = " ".join([f"{r.get('title','')} {r.get('body','')}" for r in results])
-    phones = PHONE_REGEX.findall(combined)
-    if phones:
-        d = phones[0]; result["Phone Number"] = f"({d[0]}) {d[1]}-{d[2]}"
-    emails = [e for e in EMAIL_REGEX.findall(combined)
-              if not any(x in e.lower() for x in JUNK_EMAILS)]
-    if emails: result["Email"] = emails[0]
-    for r in results:
-        if "google.com/maps" in r.get("href", ""):
-            result["Google Maps URL"] = r["href"]; break
-    if "Google Maps URL" not in result and city:
-        q2 = f"{business_name} {city} {state}".replace(" ", "+")
-        result["Google Maps URL"] = f"https://www.google.com/maps/search/{q2}"
-    return result
-
-
-ENRICH_PROMPT = """Extract contact details from this business website's text.
-
-Business: {name}
-Website: {website}
-
-Text:
------
-{page_text}
------
-
-Return ONLY JSON with these keys (use "" if missing):
-"Phone Number", "Email", "Street Address", "City", "State", "ZIP Code", "Country",
-"Facebook Page", "Instagram", "LinkedIn Company URL", "YouTube", "Twitter", "Google Maps URL"
-"""
-
-
-def fetch_website_text_multi(url, max_chars=4000):
-    if not url or not url.startswith("http"): return ""
-    combined = ""
-    for path in ["", "/contact", "/contact-us", "/about", "/about-us"]:
-        target = url.rstrip("/") + path
-        resp = safe_get(target, timeout=8)
-        if resp and resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "lxml")
-            for tag in soup(["script", "style", "noscript"]): tag.decompose()
-            text = soup.get_text(separator=" ", strip=True)
-            combined += f"\n\n--- {target} ---\n{text}"
-            if len(combined) > max_chars * 2: break
-        time.sleep(0.2)
-    return combined[:max_chars * 2]
-
-
-def enrich_lead_deep(lead):
+def enrich_lead_deep(lead, find_exec=True):
     website = lead.get("Website", "")
     name = lead.get("Business Name", "")
     city = lead.get("City", "")
     state = lead.get("State", "")
     domain = domain_from_url(website)
 
-    # 1. Crawl website
-    site_data = research_website(website)
+    site_data = {}
+    if website and (not lead.get("Phone Number") or not lead.get("Email")):
+        site_data = research_website(website)
 
-    # 2. AI parse text
-    if website:
-        page_text = fetch_website_text_multi(website)
-        if page_text:
-            try:
-                prompt = ENRICH_PROMPT.format(name=name, website=website,
-                                              page_text=page_text[:6000])
-                text = call_groq(prompt)
-                text = re.sub(r"^```(json)?", "", text).strip()
-                text = re.sub(r"```$", "", text).strip()
-                ai_data = json.loads(text)
-                for k, v in ai_data.items():
-                    if v and not site_data.get(k): site_data[k] = v
-            except Exception: pass
+    exec_data = {}
+    if find_exec and name and website and (not lead.get("Executive Name") or lead.get("Executive Name") in ("", "N/A")):
+        site_execs = find_executives(website)
+        if site_execs:
+            top = site_execs[0]
+            exec_data["Executive Name"] = top["name"]
+            exec_data["Executive Title"] = top["title"]
+            exec_data["Executive Source"] = top["source"]
+        google_exec = google_search_executive(name, city, state)
+        for k, v in google_exec.items():
+            if v and not exec_data.get(k): exec_data[k] = v
 
-    # 3. Google fallback
-    missing = [k for k in ["Phone Number", "Email", "Street Address", "Google Maps URL"]
-               if not site_data.get(k)]
-    if missing and name:
-        fb = google_search_fallback(name, city, state)
-        for k, v in fb.items():
-            if v and not site_data.get(k): site_data[k] = v
-
-    # 4. Social URL search (Facebook Page + LinkedIn Company URL)
-    if not site_data.get("Facebook Page") or not site_data.get("LinkedIn Company URL"):
+    if not lead.get("Facebook Page") or not lead.get("LinkedIn Company URL"):
         socials = find_company_socials(name, city, state)
         for k, v in socials.items():
-            if v and not site_data.get(k): site_data[k] = v
+            if v and not lead.get(k): lead[k] = v
 
-    # Clean & normalize any social URLs we have so far
-    if site_data.get("Facebook Page"):
-        site_data["Facebook Page"] = clean_facebook_url(site_data["Facebook Page"])
-    if site_data.get("LinkedIn Company URL"):
-        site_data["LinkedIn Company URL"] = clean_linkedin_company_url(site_data["LinkedIn Company URL"])
-    if site_data.get("Instagram"):
-        site_data["Instagram"] = clean_instagram_url(site_data["Instagram"])
-
-    # 5. Executive discovery
-    exec_data = {}
-    site_execs = find_executives(website) if website else []
-    if site_execs:
-        top = site_execs[0]
-        exec_data["Executive Name"] = top["name"]
-        exec_data["Executive Title"] = top["title"]
-        exec_data["Executive Source"] = top["source"]
-
-    google_exec = google_search_executive(name, city, state)
-    for k, v in google_exec.items():
-        if v and not exec_data.get(k): exec_data[k] = v
-    if "Executive Source" not in exec_data and google_exec.get("Executive Name"):
-        exec_data["Executive Source"] = "Search engines"
-
-    # 6. Email pattern
-    pattern, sample_email = detect_email_pattern(domain, name)
+    pattern, _ = detect_email_pattern(domain, name)
     exec_data["Email Pattern"] = pattern
 
     exec_email = ""
     if exec_data.get("Executive Name") and domain and pattern:
         exec_email = infer_email(pattern, exec_data["Executive Name"], domain)
-    if site_data.get("Email"):
-        exec_data["Executive Email"] = site_data["Email"]
+    if lead.get("Email"):
+        exec_data["Executive Email"] = lead["Email"]
     elif exec_email:
         exec_data["Executive Email"] = exec_email + " (inferred)"
     else:
         exec_data["Executive Email"] = "N/A"
 
-    # 7. Merge
     for k, v in site_data.items():
         if k.startswith("_"): continue
         if k in lead and not lead.get(k) and v: lead[k] = v
@@ -1017,121 +1099,68 @@ def enrich_lead_deep(lead):
     if "_address_block" in site_data and not lead.get("Street Address"):
         lead["Street Address"] = site_data["_address_block"][:120]
 
-    if not lead.get("Phone Number"):
-        lead["Phone Number"] = "N/A"
-
-    # 8. Country detection (uses all signals)
     detected = detect_country(lead)
-    if detected:
-        lead["Country"] = detected
-
+    if detected: lead["Country"] = detected
     return lead
 
 
 # ============================================================
-# WEBSITE AUDIT
+# AUDIT
 # ============================================================
 def audit_website(url):
-    result = {"score": 0, "grade": "N/A", "issues": "", "signals": {}}
+    result = {"score": 0, "grade": "N/A", "issues": ""}
     if not url or not url.startswith("http"):
         result["issues"] = "No website"; return result
-    signals = {"ssl": False, "load_time": None, "has_title": False,
-               "has_meta_desc": False, "has_viewport": False,
-               "has_phone": False, "has_email": False, "modern": 0, "size_kb": 0}
     try:
-        signals["ssl"] = urlparse(url).scheme == "https"
         t0 = time.time()
-        resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        signals["load_time"] = round(time.time() - t0, 2)
-        signals["size_kb"] = round(len(resp.content) / 1024, 1)
+        resp = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]},
+                            timeout=10, allow_redirects=True)
+        load_time = round(time.time() - t0, 2)
         soup = BeautifulSoup(resp.text, "lxml")
-        signals["has_title"] = bool(soup.find("title") and soup.find("title").text.strip())
-        signals["has_meta_desc"] = bool(soup.find("meta", attrs={"name": "description"}))
-        signals["has_viewport"] = bool(soup.find("meta", attrs={"name": "viewport"}))
-        t = soup.get_text(separator=" ", strip=True)
-        signals["has_phone"] = bool(PHONE_REGEX.search(t))
-        signals["has_email"] = bool(EMAIL_REGEX.search(t))
-        hl = resp.text.lower()
-        m = 0
-        if "google fonts" in hl or "fonts.googleapis" in hl: m += 1
-        if "bootstrap" in hl or "tailwind" in hl: m += 1
-        if "flex" in hl or "grid" in hl: m += 1
-        if "@media" in hl: m += 1
-        if "<section" in hl or "<main" in hl: m += 1
-        signals["modern"] = m
-    except requests.exceptions.Timeout:
-        result["issues"] = "Site timed out"; return result
+        has_ssl = urlparse(url).scheme == "https"
+        has_title = bool(soup.find("title") and soup.find("title").text.strip())
+        has_meta = bool(soup.find("meta", attrs={"name": "description"}))
+        has_mobile = bool(soup.find("meta", attrs={"name": "viewport"}))
+        score, issues = 0, []
+        if has_ssl: score += 20
+        else: issues.append("No SSL")
+        if load_time < 3: score += 20
+        elif load_time < 6: score += 10; issues.append(f"Slow ({load_time}s)")
+        else: issues.append(f"Very slow ({load_time}s)")
+        if has_title: score += 15
+        else: issues.append("No title")
+        if has_meta: score += 15
+        else: issues.append("No meta")
+        if has_mobile: score += 15
+        else: issues.append("Not mobile")
+        score += 15
+        score = max(0, min(100, score))
+        result["score"] = score
+        result["issues"] = "; ".join(issues) if issues else "Good"
+        if score >= 90: g = "A"
+        elif score >= 75: g = "B"
+        elif score >= 60: g = "C"
+        elif score >= 40: g = "D"
+        else: g = "F"
+        result["grade"] = g
     except Exception as e:
-        result["issues"] = f"Load error: {str(e)[:60]}"; return result
-    score, issues = 0, []
-    if signals["ssl"]: score += 15
-    else: issues.append("No SSL")
-    if signals["load_time"] is not None:
-        if signals["load_time"] < 3: score += 20
-        elif signals["load_time"] < 6: score += 10; issues.append(f"Slow ({signals['load_time']}s)")
-        else: issues.append(f"Very slow ({signals['load_time']}s)")
-    if signals["size_kb"] < 1024: score += 10
-    else: issues.append(f"Heavy ({signals['size_kb']}KB)")
-    if signals["has_title"]: score += 10
-    else: issues.append("No title")
-    if signals["has_meta_desc"]: score += 10
-    else: issues.append("No meta desc")
-    if signals["has_viewport"]: score += 15
-    else: issues.append("Not mobile")
-    if signals["has_phone"]: score += 5
-    else: issues.append("No phone on page")
-    if signals["has_email"]: score += 5
-    else: issues.append("No email on page")
-    score += min(signals["modern"] * 2, 10)
-    if signals["modern"] < 2: issues.append("Outdated design")
-    score = max(0, min(100, score))
-    result["score"] = score
-    result["signals"] = signals
-    if score >= 90: g = "A"
-    elif score >= 75: g = "B"
-    elif score >= 60: g = "C"
-    elif score >= 40: g = "D"
-    else: g = "F"
-    result["grade"] = g
-    result["issues"] = "; ".join(issues) if issues else "No major issues"
+        result["issues"] = f"Error: {str(e)[:50]}"
     return result
 
 
-def generate_pitch_angle(lead, audit):
-    try:
-        prompt = f"""Sales strategist: write ONE short sentence (max 20 words) suggesting the best pitch angle.
-
-Business: {lead.get('Business Name','')}
-Industry: {lead.get('Business Category','')}
-Audit: {audit.get('score','N/A')}/100
-Issues: {audit.get('issues','')}
-
-Return ONLY the sentence."""
-        return call_groq(prompt, temperature=0.4).strip()
-    except Exception: return ""
-
-
-def run_full_audit_on_df(df, cb=None):
-    total = len(df)
-    sc, gr, iss, ang = [], [], [], []
-    for i, row in df.iterrows():
-        ex = str(row.get("Audit Score","")).strip()
-        if ex and ex not in ("", "0"):
-            sc.append(row.get("Audit Score")); gr.append(row.get("Audit Grade"))
-            iss.append(row.get("Issues","")); ang.append(row.get("Pitch Angle",""))
-            if cb: cb(i+1, total, "cached")
-            continue
+def run_full_audit_on_df(df):
+    sc, gr, iss = [], [], []
+    for _, row in df.iterrows():
         w = row.get("Website", "")
         if w and w.startswith("http"):
             a = audit_website(w)
             sc.append(a["score"]); gr.append(a["grade"]); iss.append(a["issues"])
-            ang.append(generate_pitch_angle(row.to_dict(), a))
         else:
-            sc.append(0); gr.append("N/A"); iss.append("No website"); ang.append("")
-        if cb: cb(i+1, total, "audited")
+            sc.append(0); gr.append("N/A"); iss.append("No website")
     df = df.copy()
-    df["Audit Score"] = sc; df["Audit Grade"] = gr
-    df["Issues"] = iss; df["Pitch Angle"] = ang
+    df["Audit Score"] = sc
+    df["Audit Grade"] = gr
+    df["Issues"] = iss
     return df
 
 
@@ -1159,50 +1188,27 @@ def clean_df(rows):
     return df.reset_index(drop=True)
 
 
-def push_to_google_sheets(df, sheet_name, creds):
-    try:
-        import gspread
-        from oauth2client.service_account import ServiceAccountCredentials
-        scope = ["https://spreadsheets.google.com/feeds",
-                 "https://www.googleapis.com/auth/drive"]
-        c = ServiceAccountCredentials.from_json_keyfile_dict(creds, scope)
-        gc = gspread.authorize(c)
-        try: s = gc.open(sheet_name).sheet1
-        except gspread.SpreadsheetNotFound: s = gc.create(sheet_name).sheet1
-        s.clear()
-        s.update([df.columns.values.tolist()] + df.values.tolist())
-        return True, f"Pushed {len(df)} leads to '{sheet_name}'"
-    except Exception as e:
-        return False, f"Sheets error: {e}"
-
-
 def ask_ai_about_leads(q, df):
     txt = df.head(30).to_csv(index=False)
-    prompt = f"""You are a lead gen assistant.
-
-Data:
+    prompt = f"""Lead gen assistant. Data:
 ---LEADS---
 {txt}
 ---LEADS---
-
 User: "{q}"
-
-Answer concisely using ONLY the data."""
+Answer concisely."""
     try: return call_groq(prompt, temperature=0.3)
-    except Exception as e: return f"❌ {e}"
+    except Exception as e: return f"Error: {e}"
 
 
 def generate_email(tname, tinst, tone, lead):
     s = f"""Business: {lead.get('Business Name','')}
-Exec: {lead.get('Executive Name','')} — {lead.get('Executive Title','')}
+Exec: {lead.get('Executive Name','')} - {lead.get('Executive Title','')}
 Category: {lead.get('Business Category','')}
 City: {lead.get('City','')}, {lead.get('Country','')}
 Audit: {lead.get('Audit Score','')}/100
 Issues: {lead.get('Issues','')}
 Pitch: {lead.get('Pitch Angle','')}"""
-    prompt = f"""Expert sales copywriter.
-
-Write an email using style "{tname}".
+    prompt = f"""Sales copywriter. Write email using style "{tname}".
 Instructions: {tinst}
 Tone: {tone}
 
@@ -1210,13 +1216,12 @@ Lead:
 {s}
 
 RULES:
-- Address the executive by first name if available.
-- Weave in audit issues if relevant.
+- Address executive by first name if available.
 - Sign "Best regards, [Your Name]".
 - Start with "Subject: ..."
 - Return ONLY the email."""
     try: return call_groq(prompt, temperature=0.7)
-    except Exception as e: return f"❌ {e}"
+    except Exception as e: return f"Error: {e}"
 
 
 def generate_pdf_report(df, industry, location, keywords):
@@ -1231,10 +1236,10 @@ def generate_pdf_report(df, industry, location, keywords):
                         textColor=colors.HexColor("#222222"), spaceBefore=12, spaceAfter=6)
     st_ = []
     st_.append(Spacer(1, 1.5*inch))
-    st_.append(Paragraph("🎯 Lead Generation Report", tstyle))
+    st_.append(Paragraph("Lead Generation Report", tstyle))
     st_.append(Spacer(1, 0.3*inch))
-    cover = [["Industry:", industry or "—"], ["Location:", location or "—"],
-             ["Keywords:", keywords or "—"],
+    cover = [["Industry:", industry or "-"], ["Location:", location or "-"],
+             ["Keywords:", keywords or "-"],
              ["Generated:", datetime.now().strftime("%B %d, %Y %H:%M")],
              ["Total Leads:", str(len(df))]]
     t = Table(cover, colWidths=[2.2*inch, 3.6*inch])
@@ -1243,56 +1248,24 @@ def generate_pdf_report(df, industry, location, keywords):
                            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
                            ("TOPPADDING", (0,0), (-1,-1), 8)]))
     st_.append(t); st_.append(PageBreak())
-    st_.append(Paragraph("📋 Overview", h2))
-    rows = [["#", "Business", "Exec", "Title", "Country", "Score"]]
     for i, row in df.iterrows():
-        rows.append([str(i+1), str(row.get("Business Name",""))[:28],
-                     str(row.get("Executive Name",""))[:20],
-                     str(row.get("Executive Title",""))[:16],
-                     str(row.get("Country",""))[:14],
-                     str(row.get("Lead Score",""))])
-    t = Table(rows, colWidths=[0.4*inch, 2.2*inch, 1.5*inch, 1.2*inch, 1.2*inch, 0.6*inch])
-    t.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#FF4B4B")),
-                           ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-                           ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-                           ("FONTSIZE", (0,0), (-1,-1), 8),
-                           ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F7F7")]),
-                           ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#CCCCCC"))]))
-    st_.append(t); st_.append(PageBreak())
-    st_.append(Paragraph("🔍 Detailed Profiles", h2))
-    for i, row in df.iterrows():
-        st_.append(Paragraph(f"#{i+1} · {row.get('Business Name','')}", h2))
+        st_.append(Paragraph(f"#{i+1} - {row.get('Business Name','')}", h2))
         d = [
             ["Category", str(row.get("Business Category",""))],
             ["Lead Score", str(row.get("Lead Score",""))],
             ["AI Summary", str(row.get("AI Summary",""))],
-            ["Executive", f"{row.get('Executive Name','')} — {row.get('Executive Title','')}"],
-            ["Exec LinkedIn", str(row.get("Executive LinkedIn",""))],
-            ["Exec Email", str(row.get("Executive Email",""))],
-            ["Email Pattern", str(row.get("Email Pattern",""))],
+            ["Executive", f"{row.get('Executive Name','')} - {row.get('Executive Title','')}"],
             ["Phone", str(row.get("Phone Number",""))],
             ["Email", str(row.get("Email",""))],
             ["Website", str(row.get("Website",""))],
-            ["Address", f"{row.get('Street Address','')} {row.get('City','')} {row.get('State','')} {row.get('ZIP Code','')}".strip()],
+            ["Address", f"{row.get('Street Address','')} {row.get('City','')} {row.get('State','')}".strip()],
             ["Country", str(row.get("Country",""))],
-            ["Google Maps", str(row.get("Google Maps URL",""))],
-            ["Facebook Page", str(row.get("Facebook Page",""))],
-            ["Instagram", str(row.get("Instagram",""))],
-            ["LinkedIn Company", str(row.get("LinkedIn Company URL",""))],
-            ["YouTube", str(row.get("YouTube",""))],
-            ["Twitter/X", str(row.get("Twitter",""))],
-            ["Rating", str(row.get("Rating",""))],
-            ["Audit", f"{row.get('Audit Score','')}/100 ({row.get('Audit Grade','')})"],
-            ["Issues", str(row.get("Issues",""))],
-            ["Pitch", str(row.get("Pitch Angle",""))],
         ]
         t = Table(d, colWidths=[1.4*inch, 5.5*inch])
         t.setStyle(TableStyle([("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
                                ("FONTSIZE", (0,0), (-1,-1), 8.5),
                                ("VALIGN", (0,0), (-1,-1), "TOP"),
-                               ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-                               ("TOPPADDING", (0,0), (-1,-1), 3),
-                               ("LINEBELOW", (0,0), (-1,-2), 0.2, colors.HexColor("#EEEEEE"))]))
+                               ("BOTTOMPADDING", (0,0), (-1,-1), 3)]))
         st_.append(t); st_.append(Spacer(1, 0.2*inch))
     doc.build(st_); buf.seek(0)
     return buf.getvalue()
@@ -1306,8 +1279,13 @@ st.set_page_config(page_title="Lead Generation Assistant", layout="wide", page_i
 if "theme" not in st.session_state:
     st.session_state["theme"] = "Dark"
 
+if "df" not in st.session_state:
+    loaded = load_from_sheet()
+    if not loaded.empty:
+        st.session_state["df"] = loaded
+
 with st.sidebar:
-    st.markdown("### 🎨 Theme")
+    st.markdown("### Theme")
     tc = st.radio("Theme", ["Dark","Light","System"],
                   index=["Dark","Light","System"].index(st.session_state["theme"]),
                   horizontal=True, label_visibility="collapsed")
@@ -1319,179 +1297,308 @@ with st.sidebar:
             h1,h2,h3,h4,h5,h6,p,label,span { color: #111 !important; }
             </style>""", unsafe_allow_html=True)
     st.markdown("---")
+    st.markdown("## Cloud Sync")
+
+    # Show secret status
+    if GCP_JSON_B64:
+        st.success(f"✓ GCP secret loaded ({len(GCP_JSON_B64)} chars)")
+    else:
+        st.error("✗ GCP secret missing")
+
+    if st.button("Save to Sheet", width='stretch'):
+        if "df" in st.session_state:
+            ok, msg = save_to_sheet(st.session_state["df"])
+            if ok: st.success(msg)
+            else: st.error(msg)
+        else:
+            st.warning("No data.")
+        st.markdown("---")
     st.markdown("## 🕘 Search History")
-    hist = load_all_history()
-    if not hist:
+
+    # Load all history files
+    hist_items = []
+    try:
+        for fname in os.listdir(HISTORY_DIR):
+            if not fname.endswith(".json"): continue
+            try:
+                with open(os.path.join(HISTORY_DIR, fname), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                hist_items.append(data)
+            except Exception: continue
+        hist_items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    except Exception:
+        pass
+
+    if not hist_items:
         st.caption("No history yet.")
     else:
-        st.caption(f"{len(hist)} past searches")
-        if st.button("🗑️ Clear All History", width='stretch', type="secondary"):
-            clear_all_history(); st.success("Cleared!"); st.rerun()
-        st.markdown("---")
-        for item in hist[:30]:
-            lbl = f"📌 {item['industry']} · {item['location']}"
-            if item.get("keywords"): lbl += f" ({item['keywords']})"
-            with st.expander(lbl):
-                st.caption(f"🕐 {item['timestamp']}")
+        st.caption(f"{len(hist_items)} past searches")
+
+        if st.button("🗑️ Clear All", width='stretch'):
+            try:
+                for fname in os.listdir(HISTORY_DIR):
+                    if fname.endswith(".json"):
+                        os.remove(os.path.join(HISTORY_DIR, fname))
+                st.success("Cleared!")
+                st.rerun()
+            except Exception:
+                pass
+
+        for item in hist_items[:20]:
+            label = f"📌 {item.get('industry', '')} · {item.get('location', '')}"
+            with st.expander(label):
+                st.caption(f"🕐 {item.get('timestamp', '')}")
                 st.caption(f"👥 {item.get('lead_count', 0)} leads")
-                cA, cB = st.columns(2)
-                with cA:
-                    if st.button("📂 Load", key=f"l_{item['id']}", width='stretch'):
+                colA, colB = st.columns(2)
+                with colA:
+                    if st.button("📂 Load", key=f"load_{item['id']}", width='stretch'):
                         st.session_state["df"] = pd.DataFrame(item["leads"], columns=COLUMNS)
-                        st.session_state["chat_history"] = []
+                        st.success(f"Loaded {len(item['leads'])} leads")
                         st.rerun()
-                with cB:
-                    if st.button("🗑️ Delete", key=f"d_{item['id']}", width='stretch'):
-                        delete_history(item["id"]); st.rerun()
-
-
+                with colB:
+                    if st.button("🗑️ Delete", key=f"del_{item['id']}", width='stretch'):
+                        try:
+                            os.remove(os.path.join(HISTORY_DIR, f"{item['id']}.json"))
+                            st.rerun()
+                        except Exception:
+                            pass
 st.title("🎯 Lead Generation Assistant")
-st.caption("Multi-engine search · Executive finder · Email patterns · Clean Facebook/LinkedIn URLs · Smart country detection")
+st.caption("OpenStreetMap · Groq AI · Website enrichment · Cloud sync")
 
 c1, c2, c3, c4 = st.columns([2, 2, 1, 2])
-with c1: industry = st.text_input("Industry", value="Med Spas")
-with c2: location = st.text_input("Location", value="California")
-with c3: num_leads = st.number_input("Number of Leads", min_value=1, max_value=50, value=10)
+with c1: industry = st.text_input("Industry", value="Restaurants")
+with c2: location = st.text_input("Location", value="San Francisco, California")
+with c3: num_leads = st.number_input("Number of Leads", min_value=5, max_value=500, value=50)
 with c4: keywords = st.text_input("Keywords (optional)", placeholder="e.g. Botox, Laser")
+
+deep_research = st.checkbox("🔬 Deep research (adds socials, emails, website scrape)", value=False)
+search_executives = st.checkbox("👤 Also find executives (slower)", value=False)
 
 if st.button("Find Leads", type="primary"):
     if not industry or not location:
         st.warning("Please fill in Industry and Location."); st.stop()
+
     ph_s, ph_e, ph_r = st.empty(), st.empty(), st.empty()
     prog = st.progress(0)
-    ph_s.info("🔍 Searching (DuckDuckGo → Bing → Google)...")
-    results = multi_search(industry, location, target=num_leads)
-    if not results:
-        st.error("No results. Try again in a few minutes."); st.stop()
-    ph_s.success(f"✅ Collected {len(results)} pages.")
-    prog.progress(15)
-    ph_e.info(f"🧠 Extracting leads ({len(results)} pages)...")
-    rows = extract_leads(industry, location, keywords, results, num_leads)
-    if not rows:
-        st.error("Could not extract leads."); st.stop()
-    ph_e.success(f"✅ Extracted {len(rows)} leads.")
-    prog.progress(25)
-    df = clean_df(rows)
+
+    ph_s.info(f"Geocoding location: {location}...")
+    bbox = geocode_location(location)
+    if not bbox:
+        st.error(f"Could not find location: '{location}'")
+        st.stop()
+    ph_s.success(f"Location found: {bbox['display_name'][:80]}")
+    prog.progress(10)
+
+    tags = infer_osm_tags(industry)
+    ph_s.info(f"Querying OpenStreetMap for '{industry}'...")
+    elements = overpass_search(tags, bbox)
+    if not elements:
+        st.error("No businesses found.")
+        st.stop()
+
+    leads = []
+    for el in elements:
+        p = parse_overpass_element(el, industry)
+        if p: leads.append(p)
+
+    seen = set(); unique = []
+    for l in leads:
+        key = l.get("Business Name", "").strip().lower()
+        if key and key not in seen:
+            seen.add(key); unique.append(l)
+
+    ph_s.success(f"Found {len(unique)} unique businesses.")
+    prog.progress(30)
+
+    unique = unique[:num_leads * 2]
+
+    ph_e.info(f"AI scoring {len(unique)} leads...")
+    scores = batch_ai_score(unique, batch_size=25)
+    for i, (score, summary) in enumerate(scores):
+        unique[i]["Lead Score"] = score
+        unique[i]["AI Summary"] = summary
+    ph_e.success("AI scoring complete.")
+    prog.progress(45)
+
+    for l in unique:
+        l.setdefault("Outreach Status", "New")
+
+    df = clean_df(unique)
+
     er = df.to_dict(orient="records")
-    total = len(er)
-    for i, lead in enumerate(er):
-        ph_r.info(f"🔬 Deep researching {i+1}/{total}: {lead.get('Business Name','')[:40]}")
-        try:
-            er[i] = enrich_lead_deep(lead)
-        except Exception as e:
-            st.warning(f"Enrich failed: {e}")
-        prog.progress(25 + int(((i+1)/total) * 65))
-    prog.empty(); ph_r.empty()
+    if deep_research:
+        to_enrich = min(len(er), num_leads)
+        ph_r.info(f"🔬 Deep research on {to_enrich} leads (parallel)...")
+
+        completed = [0]
+        enriched_results = list(er)
+
+        def _enrich_one(idx_lead):
+            idx, lead = idx_lead
+            try:
+                return idx, enrich_lead_deep(lead, find_exec=search_executives)
+            except Exception:
+                return idx, lead
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(_enrich_one, (i, er[i])) for i in range(to_enrich)]
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    i, res = fut.result()
+                    enriched_results[i] = res
+                except Exception:
+                    pass
+                completed[0] += 1
+                prog.progress(45 + int((completed[0] / to_enrich) * 45))
+                ph_r.info(f"🔬 Deep research: {completed[0]}/{to_enrich} done")
+
+        er = enriched_results
+        prog.empty(); ph_r.empty()
+    else:
+        ph_r.success("⚡ Fast mode: skipping deep research")
+        time.sleep(1)
+        prog.empty(); ph_r.empty()
+
     df = clean_df(er)
+    df = df.head(num_leads).reset_index(drop=True)
+
+    for col in ["Executive Name", "Executive Title", "Executive Email", "Executive LinkedIn"]:
+        if col in df.columns:
+            df[col] = df[col].replace("", "N/A")
+
+    if "Outreach Status" not in df.columns:
+        df["Outreach Status"] = "New"
+    df["Outreach Status"] = df["Outreach Status"].replace("", "New")
+
     pi = build_previous_leads_index()
     df = mark_duplicates(df, pi)
     dc = (df["Duplicate"] == "Yes").sum()
     if dc > 0:
-        st.info(f"🔁 {dc} duplicate(s) · {len(df)-dc} new")
+        st.info(f"{dc} duplicate(s) found")
+
     st.session_state["df"] = df
-    st.session_state["chat_history"] = []
-    st.session_state["search_industry"] = industry
-    st.session_state["search_location"] = location
-    st.session_state["search_keywords"] = keywords
     save_history(industry, location, keywords, df)
+    tab_name = f"{industry[:20]}-{location[:25]}".replace("/", "-").replace("\\", "-")
+
+    with st.spinner(f"Saving to new tab '{tab_name}'..."):
+        ok, msg = save_to_sheet(df, tab_name=tab_name)
+    if ok:
+        st.success(f"☁️ {msg}")
+        if "→" in msg:
+            sheet_url = msg.split("→")[-1].strip()
+            st.markdown(f"[**📊 Open Google Sheet tab →**]({sheet_url})")
+    else:
+        st.warning(f"⚠️ Cloud sync: {msg}")
 
 
 if "df" in st.session_state:
     df = st.session_state["df"]
     st.success(f"Found {len(df)} businesses")
 
-    st.markdown("#### 🔎 Filter")
+    st.markdown("---")
+    st.markdown("### 📞 Outreach Status")
+    status_col1, status_col2 = st.columns([2, 3])
+    with status_col1:
+        lead_names = df["Business Name"].tolist()
+        sel_lead = st.selectbox("Select lead", lead_names, key="outreach_lead_sel")
+    with status_col2:
+        current_status = df[df["Business Name"] == sel_lead]["Outreach Status"].iloc[0] if not df.empty else "New"
+        if current_status not in OUTREACH_OPTIONS:
+            current_status = "New"
+        new_status = st.radio("Status", OUTREACH_OPTIONS,
+                              index=OUTREACH_OPTIONS.index(current_status),
+                              horizontal=True, key="outreach_status_radio")
+        if new_status != current_status:
+            df.loc[df["Business Name"] == sel_lead, "Outreach Status"] = new_status
+            st.session_state["df"] = df
+            ok, msg = save_to_sheet(df)
+            if ok:
+                st.success(f"Status set to '{new_status}'")
+            else:
+                st.warning(f"Saved locally. {msg}")
+
+    st.markdown("#### Filter")
     fc, _ = st.columns([1, 3])
     with fc:
-        vm = st.selectbox("Show:", ["All leads", "Only new (not seen before)", "Only duplicates"], key="filter_mode")
+        vm = st.selectbox("Show:", ["All leads", "Only new", "Only duplicates"], key="filter_mode")
     vdf = df.copy()
-    if vm == "Only new (not seen before)": vdf = vdf[vdf["Duplicate"] == "No"]
+    if vm == "Only new": vdf = vdf[vdf["Duplicate"] == "No"]
     elif vm == "Only duplicates": vdf = vdf[vdf["Duplicate"] == "Yes"]
-    st.caption(f"Showing **{len(vdf)}** of **{len(df)}**")
+    st.caption(f"Showing {len(vdf)} of {len(df)}")
 
-    priority = ["Business Name", "Duplicate", "Executive Name", "Executive Title",
-                "Executive Email", "Executive LinkedIn",
-                "Lead Score", "Audit Grade", "Phone Number", "Email", "Website",
-                "Street Address", "City", "State", "ZIP Code", "Country",
-                "Google Maps URL", "Facebook Page", "Instagram", "LinkedIn Company URL",
-                "YouTube", "Twitter"]
+    priority = ["Business Name", "Outreach Status", "Duplicate", "Lead Score",
+                "Phone Number", "Email", "Website", "Street Address", "City",
+                "State", "ZIP Code", "Country", "Google Maps URL",
+                "Executive Name", "Executive Title", "Executive Email", "Executive LinkedIn",
+                "Facebook Page", "Instagram", "LinkedIn Company URL",
+                "Audit Grade", "Audit Score"]
     priority = [c for c in priority if c in vdf.columns]
     others = [c for c in vdf.columns if c not in priority]
     st.dataframe(vdf[priority + others], width='stretch')
 
-    st.markdown("---"); st.markdown("### 🔍 Website Quality Audit")
-    if st.button("🚀 Run Website Audit", type="primary"):
-        ap = st.progress(0); ast = st.empty()
-        def upd(c, t, a):
-            ap.progress(c/t); ast.info(f"🔍 {c}/{t}...")
+    st.markdown("---"); st.markdown("### Website Quality Audit")
+    if st.button("Run Website Audit", type="primary"):
         with st.spinner("Auditing..."):
-            da = run_full_audit_on_df(df, cb=upd)
-        ap.empty(); ast.success(f"✅ Audited!")
+            da = run_full_audit_on_df(df)
         st.session_state["df"] = da
-        save_history(st.session_state.get("search_industry",""),
-                     st.session_state.get("search_location",""),
-                     st.session_state.get("search_keywords",""), da)
+        save_to_sheet(da)
+        st.success("Audit complete!")
         st.rerun()
 
-    st.markdown("---"); st.markdown("### 📧 Email Generator")
+    st.markdown("---"); st.markdown("### Email Generator")
     ec1, ec2, ec3 = st.columns([3, 2, 2])
     with ec1:
         names = vdf["Business Name"].tolist() if not vdf.empty else df["Business Name"].tolist()
         sel_name = st.selectbox("Lead", names, key="email_lead_select")
     with ec2: sel_tpl = st.selectbox("Template", list(EMAIL_TEMPLATES.keys()), key="email_template_select")
     with ec3: sel_tone = st.selectbox("Tone", TONES, key="email_tone_select")
-    if st.button("✨ Generate Email", type="primary"):
+    if st.button("Generate Email", type="primary"):
         row = df[df["Business Name"] == sel_name].iloc[0].to_dict()
         with st.spinner("Writing..."):
             st.session_state["generated_email"] = generate_email(sel_tpl, EMAIL_TEMPLATES[sel_tpl], sel_tone, row)
     if st.session_state.get("generated_email"):
-        st.markdown("#### 📝 Generated Email")
+        st.markdown("#### Generated Email")
         ed = st.text_area("Edit:", value=st.session_state["generated_email"], height=300)
-        ch = f"""<button onclick="navigator.clipboard.writeText(`{ed.replace('`',"'").replace(chr(92), chr(92)*2)}`).then(()=>{{this.innerText='✅';setTimeout(()=>{{this.innerText='📋 Copy';}},2000);}})" style="width:100%;background-color:#4CAF50;color:white;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">📋 Copy Email</button>"""
-        components.html(ch, height=50)
+        st.text_area("📋 Copy below (Ctrl+A, Ctrl+C):", value=ed, height=100, key="copy_area")
 
+        # --- EXPORT ---
     st.markdown("---"); st.markdown("### 📤 Export")
-    ec1, ec2, ec3, ec4, ec5 = st.columns(5)
+
+    ec1, ec2, ec3, ec4 = st.columns(4)
+
     with ec1:
-        st.download_button("📥 CSV", vdf.to_csv(index=False).encode(), "leads.csv", "text/csv", width='stretch')
+        st.download_button("📥 CSV", vdf.to_csv(index=False).encode(),
+                           "leads.csv", "text/csv", width='stretch')
+
     with ec2:
         try:
             buf = BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
                 vdf.to_excel(w, index=False, sheet_name="Leads")
             st.download_button("📥 Excel", buf.getvalue(), "leads.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width='stretch')
-        except Exception as e: st.warning(f"Excel: {e}")
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width='stretch')
+        except Exception as e:
+            st.warning(f"Excel: {e}")
+
     with ec3:
-        with st.popover("📊 Sheets", width='stretch'):
-            sn = st.text_input("Sheet Name", value="Lead Gen Results", key="gsheet_name")
-            upl = st.file_uploader("JSON", type=["json"], key="gsheet_json")
-            if st.button("🚀 Push Now", key="push_gsheet", width='stretch'):
-                if upl is not None:
-                    try:
-                        c = json.load(upl)
-                        with st.spinner("Pushing..."):
-                            ok, m = push_to_google_sheets(vdf, sn, c)
-                        st.success(m) if ok else st.error(m)
-                    except Exception as e: st.error(f"JSON error: {e}")
-                else: st.warning("Upload JSON.")
+        # Google Sheet direct link + push button
+        sheet_url = "https://docs.google.com/spreadsheets/d/1AjfsCTB8zrgiQo0OWjVaRwC_ENjjzPV0i1hQ8GzWkKc/edit"
+        if st.button("📊 Open Google Sheet", width='stretch'):
+            # Push current data first, then open
+            ok, msg = save_to_sheet(vdf)
+            if ok:
+                st.success("Synced! Opening...")
+            st.markdown(f'<meta http-equiv="refresh" content="0; url={sheet_url}">',
+                       unsafe_allow_html=True)
+            st.markdown(f"[**Click here if it doesn't open →**]({sheet_url})")
+
     with ec4:
-        cs = vdf.to_csv(index=False).replace("`","'").replace("\\","\\\\")
-        ch = f"""<button onclick="navigator.clipboard.writeText(`{cs}`).then(()=>{{this.innerText='✅';setTimeout(()=>{{this.innerText='📋 Copy';}},2000);}})" style="width:100%;background-color:#FF4B4B;color:white;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">📋 Copy</button>"""
-        components.html(ch, height=50)
-    with ec5:
-        if st.button("📄 PDF", width='stretch'):
-            with st.spinner("Building..."):
-                try:
-                    st.session_state["pdf_bytes"] = generate_pdf_report(
-                        vdf, st.session_state.get("search_industry",""),
-                        st.session_state.get("search_location",""),
-                        st.session_state.get("search_keywords",""))
-                except Exception as e: st.error(f"PDF: {e}")
-    if st.session_state.get("pdf_bytes"):
-        st.download_button("⬇️ Download PDF", st.session_state["pdf_bytes"],
-            f"lead_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-            "application/pdf", width='stretch')
+        if st.button("📋 Copy", width='stretch'):
+            st.session_state["show_copy"] = not st.session_state.get("show_copy", False)
+
+    if st.session_state.get("show_copy"):
+        st.code(vdf.to_csv(index=False), language="text")
 
     st.markdown("---"); st.markdown("### 💬 Chat with Your Leads")
     if "chat_history" not in st.session_state:

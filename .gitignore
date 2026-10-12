@@ -8,3 +8,5 @@ history/
 *.xlsx
 .vscode/
 .idea/
+*.json
+desktop.ini
